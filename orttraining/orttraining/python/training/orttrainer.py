@@ -646,12 +646,9 @@ class ORTTrainer(object):
         ort_parameters.horizontal_parallel_size = self.options.distributed.horizontal_parallel_size
         ort_parameters.pipeline_parallel_size = self.options.distributed.pipeline_parallel_size
         ort_parameters.num_pipeline_steps = self.options.distributed.num_pipeline_steps
+        ort_parameters.original_batch_size = self.options.distributed.original_batch_size
+        ort_parameters.pipeline_batch_size = self.options.distributed.pipeline_batch_size
         ort_parameters.pipeline_cut_info_string = self.options.distributed.pipeline_cut_info_string
-
-        print('[orttrainer.py] ort_parameters.data_parallel_size=', ort_parameters.data_parallel_size)
-        print('[orttrainer.py] ort_parameters.horizontal_parallel_size=', ort_parameters.horizontal_parallel_size)
-        print('[orttrainer.py] ort_parameters.pipeline_parallel_size=', ort_parameters.pipeline_parallel_size)
-        print('[orttrainer.py] ort_parameters.num_pipeline_steps=', ort_parameters.num_pipeline_steps)
 
         # SessionOptions
         session_options = ort.SessionOptions()
@@ -808,7 +805,6 @@ class ORTTrainer(object):
         # Bind input tensors
         for input, input_desc in zip(inputs, inputs_desc):
             device_index = _utils.get_device_index_from_input(input)
-            print('bind ', ', name: ', input_desc.name, ', type: ', input.device.type, ', index: ', device_index)
             iobinding.bind_input(input_desc.name,
                                  input.device.type,
                                  device_index,
