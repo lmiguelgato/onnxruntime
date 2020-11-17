@@ -92,16 +92,6 @@ class ORTTrainerOptions(object):
                             'min' : 1,
                             'default' : 1
                         },
-                        'original_batch_size' : {
-                            'type' : 'integer',
-                            'min' : 1,
-                            'default' : 1
-                        },
-                        'pipeline_batch_size' : {
-                            'type' : 'integer',
-                            'min' : 1,
-                            'default' : 1
-                        },
                         'pipeline_cut_info_string': {
                             'type': 'string',
                             'default': ''
@@ -126,6 +116,29 @@ class ORTTrainerOptions(object):
                         'enable_adasum' : {
                             'type' : 'boolean',
                             'default' : False
+                        },
+                        'sliced_schema' : {
+                            "type": "dict",
+                            # the keys in `employee_eligibility` are strings matching this regex
+                            "keysrules": {"type": "string"},
+                            # the values in `employee_eligibility` are also dictionaries with keys
+                            # that are strings that match this regex and integer values
+                            "valuesrules": {
+                                "type": "list",
+                                "schema": {'type': 'integer'}
+                            }
+                        },
+                        'sliced_axes' : {
+                            'type': 'dict',
+                            'keysrules': {'type': 'string'},
+                            'valuesrules': {
+                                'type': 'integer',
+                                'default': 0
+                            }
+                        },
+                        'sliced_tensor_names' : {
+                            'type': 'list',
+                            'schema': {'type': 'string'}
                         }
                     }
                 },
@@ -265,10 +278,6 @@ class ORTTrainerOptions(object):
             number of ranks participating in pipeline parallelism
         distributed.num_pipeline_steps (int, default is 1):
             number of sub-batches. We divide input batch into sub-batches and run the graph.
-        distributed.original_batch_size (int, default is 1):
-            batch size.
-        distributed.pipeline_batch_size (int, default is 1):
-            batch size of sub-batches.
         distributed.pipeline_cut_info_string (string, default is ''):
             string of cutting ids for pipeline partition.
         distributed.allreduce_post_accumulation (bool, default is False):
@@ -493,16 +502,6 @@ _ORTTRAINER_OPTIONS_SCHEMA = {
                 'min': 1,
                 'default': 1
             },
-            'original_batch_size': {
-                'type': 'integer',
-                'min': 1,
-                'default': 1
-            },
-            'pipeline_batch_size': {
-                'type': 'integer',
-                'min': 1,
-                'default': 1
-            },
             'pipeline_cut_info_string': {
                 'type': 'string',
                 'default': ''
@@ -527,8 +526,29 @@ _ORTTRAINER_OPTIONS_SCHEMA = {
             'enable_adasum': {
                 'type': 'boolean',
                 'default': False
+            },
+            'sliced_schema' : {
+                'type': 'dict',
+                'keysrules': {'type': 'string'},
+                'valuesrules': {
+                    'type': 'list',
+                    'schema': {'type': 'integer'}
+                },
+                'default_setter': lambda _: {}
+            },
+            'sliced_axes' : {
+                'type': 'dict',
+                'keysrules': {'type': 'string'},
+                'valuesrules': {
+                    'type': 'integer',
+                    'default': 0
+                }
+            },
+            'sliced_tensor_names' : {
+                'type': 'list',
+                'schema': {'type': 'string'},
+                'default': []
             }
-
         }
     },
     'lr_scheduler': {
