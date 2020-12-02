@@ -48,7 +48,7 @@ struct TrainingParameters {
   int data_parallel_size = 1;
   int horizontal_parallel_size = 1;
   int pipeline_parallel_size = 1;
-  int num_pipeline_steps = 1;
+  int num_pipeline_micro_batches = 1;
   int deepspeed_zero_stage = 0;
   bool enable_grad_norm_clip = true;
   bool set_gradients_as_graph_outputs = false;
@@ -98,7 +98,7 @@ TrainingConfigurationResult ConfigureSessionForTraining(
   config.distributed_config.data_parallel_size = parameters.data_parallel_size;
   config.distributed_config.horizontal_parallel_size = parameters.horizontal_parallel_size;
   config.distributed_config.pipeline_parallel_size = parameters.pipeline_parallel_size;
-  config.distributed_config.num_pipeline_steps = parameters.num_pipeline_steps;
+  config.distributed_config.num_pipeline_micro_batches = parameters.num_pipeline_micro_batches;
   config.distributed_config.sliced_schema = parameters.sliced_schema;
   config.distributed_config.sliced_axes = parameters.sliced_axes;
   config.distributed_config.sliced_tensor_names = parameters.sliced_tensor_names;
@@ -120,9 +120,8 @@ TrainingConfigurationResult ConfigureSessionForTraining(
     auto process_with_delimiter = [](std::string& input_str, const std::string& delimiter) {
         std::vector<std::string> result;
         size_t pos = 0;
-        std::string token;
         while ((pos = input_str.find(delimiter)) != std::string::npos) {
-          token = input_str.substr(0, pos);
+          std::string token = input_str.substr(0, pos);
           result.emplace_back(token);
           input_str.erase(0, pos + delimiter.length());
         }
@@ -267,7 +266,7 @@ void addObjectMethodsForTraining(py::module& m) {
       .def_readwrite("horizontal_parallel_size", &TrainingParameters::horizontal_parallel_size)
       .def_readwrite("pipeline_parallel_size", &TrainingParameters::pipeline_parallel_size)
       .def_readwrite("pipeline_cut_info_string", &TrainingParameters::pipeline_cut_info_string)
-      .def_readwrite("num_pipeline_steps", &TrainingParameters::num_pipeline_steps)
+      .def_readwrite("num_pipeline_micro_batches", &TrainingParameters::num_pipeline_micro_batches)
       .def_readwrite("gradient_accumulation_steps", &TrainingParameters::gradient_accumulation_steps)
       .def_readwrite("deepspeed_zero_stage", &TrainingParameters::deepspeed_zero_stage)
       .def_readwrite("enable_grad_norm_clip", &TrainingParameters::enable_grad_norm_clip)
@@ -352,7 +351,6 @@ void addObjectMethodsForTraining(py::module& m) {
 
         std::vector<std::string> provider_types = {};
         InitializeSession(sess->GetSessionHandle(), provider_types);
-
         return config_result;
       })
       .def("get_state", [](PyTrainingSession* sess) {

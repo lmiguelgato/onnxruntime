@@ -66,15 +66,18 @@ class TrainingSession : public InferenceSession {
       int horizontal_parallel_size{1};
       // The number of pipeline stages.
       int pipeline_parallel_size{1};
-
-      int num_pipeline_steps{1};
-
+      // The number of micro-batches run by pipeline parallel after calling one session.Run(...).
+      int num_pipeline_micro_batches{1};
+      // We assume one process only run a portion of the graph when pipeline parallel is enabled.
+      // This field is the graph partition's ID this process run.
       int pipeline_stage_id{0};
-
       // This field contains ONNX model's names for input and output tensors to be sliced.
       std::vector<std::string> sliced_tensor_names;
-      // Shapes of sliced inputs and outputs.
+      // Shapes of inputs and outputs for micro-batch.
       std::unordered_map<std::string, std::vector<int>> sliced_schema;
+      // The axies to slice tensors along to create tensors in micro-batch.
+      // If we have a tensor named "x", slicing x along axis sliced_axes["x"] generates
+      // "x" in micro-batch.
       std::unordered_map<std::string, int> sliced_axes;
     };
     // The distributed training configuration.
@@ -334,9 +337,6 @@ class TrainingSession : public InferenceSession {
   using InferenceSession::Run;  // For overload resolution.
   common::Status Run(const RunOptions& run_options, IOBinding& io_binding) override;
 
-  common::Status RunWithoutPipeline(const RunOptions& run_options, IOBinding& io_binding);
-  common::Status RunWithPipeline(const RunOptions& run_options, IOBinding& io_binding);
-
  private:
   void CreatePipelineEvents(
       const bool traning_mode,
@@ -344,11 +344,16 @@ class TrainingSession : public InferenceSession {
       const int stage_id,
       IOBinding& io_binding);
 
-  void CreateBatchVariables(
+  void CreateMicroBatchVariables(
       IOBinding& io_binding, IOBinding& sub_io_binding,
       const size_t slice_id, const size_t num_slices);
 
+#if defined(USE_NCCL) && defined(USE_NCCL_P2P)
   void LaunchNcclService(const int pipeline_stage_id);
+#endif
+
+  common::Status RunWithoutPipeline(const RunOptions& run_options, IOBinding& io_binding);
+  common::Status RunWithPipeline(const RunOptions& run_options, IOBinding& io_binding);
 
   /** Configures the loss function.
   The loss function can either be provided externally or built from the provided loss function information.

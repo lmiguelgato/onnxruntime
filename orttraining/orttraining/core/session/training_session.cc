@@ -6,6 +6,7 @@
 #include "core/framework/data_transfer_utils.h"
 #include "core/graph/model.h"
 #include "core/session/IOBinding.h"
+#include "core/optimizer/rule_based_graph_transformer.h"
 #include "core/providers/cpu/controlflow/utils.h"
 #include "core/providers/cpu/cpu_execution_provider.h"
 #include "orttraining/core/graph/loss_function_builder.h"
@@ -15,13 +16,12 @@
 #include "orttraining/core/framework/distributed_run_context.h"
 #include "orttraining/core/graph/optimizer_graph_builder_registry.h"
 #include "orttraining/core/optimizer/graph_transformer_utils.h"
-#include "core/optimizer/rule_based_graph_transformer.h"
 #include "orttraining/core/graph/mixed_precision_transformer.h"
 #include "orttraining/core/graph/tensorboard_transformer.h"
 #include "orttraining/core/graph/pipeline_transformer.h"
 #include "orttraining/core/graph/gradient_builder_base.h"
+#include "orttraining/core/session/tensor_helper.h"
 #include "orttraining/models/runner/training_util.h"
-#include "orttraining/core/session/tensorhelper.h"
 
 //Gist Encoding
 #include "orttraining/core/optimizer/gist_encode_decode.h"
@@ -111,7 +111,6 @@ Status SetupOptimizerParams(
   // TODO make OptimizerGraphConfig::loss_scale_input_name optional<string>
   opt_graph_config.loss_scale_input_name =
       loss_scale_input_name.has_value() ? loss_scale_input_name.value() : "";
-  ;
   opt_graph_config.local_size = DistributedRunContext::RunConfig().local_size;
   opt_graph_config.local_rank = DistributedRunContext::RunConfig().local_rank;
   opt_graph_config.data_parallel_group_rank = DistributedRunContext::RankInGroup(WorkerGroupType::DataParallel);
@@ -154,15 +153,16 @@ void TrainingSession::FilterUnusedWeights(const std::unordered_set<std::string>&
 
 const std::string TrainingSession::training_mode_string_ = "training_mode";
 
+#if defined(USE_NCCL) && defined(USE_NCCL_P2P)
 // Create NCCL's communication plan. In runtime, we will provide details such
 // as pointer to sent/recieved data and the size of the data in byte. See how
 // Send and Recv call SubmitSendAndWait and SubmitRecvAndWait, respectively.
 void TrainingSession::LaunchNcclService(const int pipeline_stage_id) {
+  ORT_ENFORCE(pipeline_stage_id >= 0, "Pipeline stage ID cannot be negative.");
   auto& nccl_service = cuda::NcclService::GetInstance();
 
   // Create NCCL communication plan. The plan is a vector of communication task group.
   // Each communication task group contains tasks which should be done in parallel.
-  nccl_service.PlanStart();
   for (auto& slot : pipeline_schedule_.GetSchedule(pipeline_stage_id)) {
     if (!slot.HasCommute()) {
       continue;
@@ -187,6 +187,7 @@ void TrainingSession::LaunchNcclService(const int pipeline_stage_id) {
   // Launch NCCL service to execute the plan.
   nccl_service.Launch();
 }
+#endif
 
 Status TrainingSession::ConfigureForTraining(
     const TrainingConfiguration& config, TrainingConfigurationResult& config_result_out) {
@@ -213,7 +214,7 @@ Status TrainingSession::ConfigureForTraining(
                                          config.distributed_config.horizontal_parallel_size,
                                          config.distributed_config.pipeline_parallel_size});
 
-  const int32_t pipeline_stage_id = config.pipeline_config.has_value() ? DistributedRunContext::RankInGroup(WorkerGroupType::ModelParallel) : -1;
+  const int32_t pipeline_stage_id = config.pipeline_config.has_value() ? DistributedRunContext::RankInGroup(WorkerGroupType::PipelineParallel) : -1;
 
   ORT_ENFORCE(pipeline_context_.expected_output_names.empty(),
               "Uninitialized output name list should be empty. ",
@@ -236,7 +237,7 @@ Status TrainingSession::ConfigureForTraining(
     if (config.pipeline_config.value().partitioned_model_path.has_value()) {
       // Save the partitioned file out.
       // To avoid writing conflict, only the ranks in first pipeline group write the partition file out.
-      if (DistributedRunContext::GroupId(WorkerGroupType::ModelParallel) == 0) {
+      if (DistributedRunContext::GroupId(WorkerGroupType::PipelineParallel) == 0) {
         ORT_IGNORE_RETURN_VALUE(Save(
             config.pipeline_config.value().partitioned_model_path.value(), SaveOption::NO_RELOAD));
       }
@@ -355,13 +356,13 @@ Status TrainingSession::ConfigureForTraining(
       weight_names_to_train, loss_name, config.gradient_graph_config, *session_logger_));
 
   if (config.pipeline_config.has_value()) {
-    // TODO: The number of pipeline steps should be passed in from Python API.
-    const int num_pipeline_steps = config.distributed_config.num_pipeline_steps;
+    // The number of batches executed by pipeline parallel.
+    const int num_pipeline_micro_batches = config.distributed_config.num_pipeline_micro_batches;
     const int num_pipeline_stages = config.distributed_config.pipeline_parallel_size;
-    pipeline_schedule_ = pipeline::PipelineScheduler(num_pipeline_steps, num_pipeline_stages);
+    pipeline_schedule_ = pipeline::PipelineScheduler(num_pipeline_micro_batches, num_pipeline_stages);
     pipeline_worker_pool_ = pipeline::PipelineWorkerPool(num_pipeline_stages);
 
-    // Insert InsertPipelineOps may access "sliced_schema" from "pipeline_context_".
+    // Insert PipelineOps may access "sliced_schema" from "pipeline_context_".
     pipeline_context_.sliced_schema = config.distributed_config.sliced_schema;
     // Declare a place holder for pipeline configuration.
     TrainingConfigurationResult::PipelineConfigurationResult pipeline_result{};
@@ -394,7 +395,7 @@ Status TrainingSession::ConfigureForTraining(
         (config.distributed_config.data_parallel_size * config.distributed_config.horizontal_parallel_size);
 
     // TODO: keep all other pipeline context fields such as feed_names.
-    pipeline_context_.num_pipeline_steps = num_pipeline_steps;
+    pipeline_context_.num_pipeline_micro_batches = num_pipeline_micro_batches;
     pipeline_context_.num_pipeline_stages = config.distributed_config.pipeline_parallel_size;
     pipeline_context_.pipeline_stage_id = pipeline_result.pipeline_stage_id;
     pipeline_context_.sliced_axes = config.distributed_config.sliced_axes;
@@ -416,9 +417,9 @@ Status TrainingSession::ConfigureForTraining(
   } else {
     pipeline_schedule_ = pipeline::PipelineScheduler(1, config.distributed_config.pipeline_parallel_size);
     pipeline_worker_pool_ = pipeline::PipelineWorkerPool(config.distributed_config.pipeline_parallel_size);
-    pipeline_context_.num_pipeline_steps = 1;
+    pipeline_context_.num_pipeline_micro_batches = 1;
     pipeline_context_.num_pipeline_stages = config.distributed_config.pipeline_parallel_size;
-    pipeline_context_.pipeline_stage_id = DistributedRunContext::GroupId(WorkerGroupType::ModelParallel);
+    pipeline_context_.pipeline_stage_id = 0;
   }
 
   // All non-float tensors are not trainable. Remove those weights.
@@ -510,7 +511,7 @@ Status TrainingSession::ConfigureForTraining(
   // writing conflict, only the ranks in first pipeline group write the partition file out.
   // model_with_training_graph_path value.
   if ((IsRootNode(config) || (config.pipeline_config.has_value() &&
-                              DistributedRunContext::GroupId(WorkerGroupType::ModelParallel) == 0)) &&
+                              DistributedRunContext::GroupId(WorkerGroupType::PipelineParallel) == 0)) &&
       config.model_with_training_graph_path.has_value()) {
     ORT_IGNORE_RETURN_VALUE(Save(
         config.model_with_training_graph_path.value(), SaveOption::NO_RELOAD));
@@ -1041,58 +1042,48 @@ common::Status TrainingSession::RunWithoutPipeline(const RunOptions& run_options
   return InferenceSession::Run(run_options, io_binding);
 }
 
-void TrainingSession::CreateBatchVariables(
+// This function first create two local helper functions.
+// Then, the helpers are used to create micro-batch from input batch.
+void TrainingSession::CreateMicroBatchVariables(
     IOBinding& io_binding,
     IOBinding& sub_io_binding,
     const size_t slice_id,
     const size_t num_slices) {
-  auto& inputs = io_binding.GetInputs();
-  const auto& input_names = io_binding.GetInputNames();
-
-  ORT_ENFORCE(inputs.size() == input_names.size(), "\"input\" and their names are parallel. One input should have one name.");
-
-  auto has_element = [&](const std::vector<std::string> vector, const std::string element) {
+  // Return true if "element" can be found in "vector". Otherwise, return false.
+  auto has_element = [&](const std::vector<std::string>& vector, const std::string& element) {
     auto it = std::find(vector.begin(), vector.end(), element);
-    if (it != vector.end()) {
-      return true;
-    } else {
-      return false;
+    return it != vector.end();
+  };
+
+  // Slice "values" and bind their slices to "sub_io_binding" them by calling "bind".
+  // names[i] is the name of the slice in values[i].
+  auto bind_slices = [&](const std::vector<std::string>& names, const std::vector<OrtValue>& values, common::Status(IOBinding::*bind)(const std::string&, const OrtValue&)) {
+    ORT_ENFORCE(names.size() == values.size(), "\"values\" and their \"names\" are parallel. One value should have one name.");
+
+    // At the i-th iteration, we slice the values[i] into a sub-tensor and bind it.
+    for (size_t i = 0; i < values.size(); ++i) {
+      const auto& name = names[i];
+      ORT_ENFORCE(pipeline_context_.sliced_axes[name] >= 0,
+                  "Sliced axis of input \"", name, "\" must be non-negative but got ", pipeline_context_.sliced_axes[name]);
+      const size_t slice_axis = static_cast<size_t>(pipeline_context_.sliced_axes[name]);
+      if (has_element(pipeline_context_.sliced_tensor_names, name)) {
+        OrtValue sliced_value = SliceTensor(values[i], slice_id, slice_axis, num_slices, *this);
+        (sub_io_binding.*bind)(name, sliced_value);
+      } else {
+        (sub_io_binding.*bind)(name, values[i]);
+      }
     }
   };
 
-  // Slice input tensors.
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    const auto name = input_names[i];
-    ORT_ENFORCE(pipeline_context_.sliced_axes[name] >= 0,
-                "Sliced axis of input \"", name, "\" must be non-negative but got ", pipeline_context_.sliced_axes[name]);
-    const size_t slice_axis = static_cast<size_t>(pipeline_context_.sliced_axes[name]);
+  // Add sliced inputs to "sub_io_binding".
+  auto& inputs = io_binding.GetInputs();
+  const auto& input_names = io_binding.GetInputNames();
+  bind_slices(input_names, inputs, &IOBinding::BindInput);
 
-    if (has_element(pipeline_context_.sliced_tensor_names, name)) {
-      OrtValue sliced_value = SliceTensor(inputs[i], slice_id, slice_axis, num_slices, *this);
-      sub_io_binding.BindInput(name, sliced_value);
-    } else {
-      sub_io_binding.BindInput(name, inputs[i]);
-    }
-  }
-
+  // Add sliced outputs to "sub_io_binding".
   auto& outputs = io_binding.GetOutputs();
   const auto& output_names = io_binding.GetOutputNames();
-
-  ORT_ENFORCE(outputs.size() == output_names.size(), "\"output\" and their names are parallel. One output should have one name.");
-
-  // Slice output tensors.
-  for (size_t i = 0; i < outputs.size(); ++i) {
-    const auto name = output_names[i];
-    ORT_ENFORCE(pipeline_context_.sliced_axes[name] >= 0,
-                "Sliced axis of output \"", name, "\" must be non-negative but got ", pipeline_context_.sliced_axes[name]);
-    const size_t slice_axis = static_cast<size_t>(pipeline_context_.sliced_axes[name]);
-    if (has_element(pipeline_context_.sliced_tensor_names, name)) {
-      OrtValue sliced_value = SliceTensor(outputs[i], slice_id, slice_axis, num_slices, *this);
-      sub_io_binding.BindOutput(name, sliced_value);
-    } else {
-      sub_io_binding.BindOutput(name, outputs[i]);
-    }
-  }
+  bind_slices(output_names, outputs, &IOBinding::BindOutput);
 }
 
 void TrainingSession::CreatePipelineEvents(
@@ -1170,12 +1161,12 @@ void TrainingSession::CreatePipelineEvents(
   append_to_io_binding(pipeline_context_.pipeline_tensor_names.backward_compute_recorded_event_name, id);
 }
 
-// This function splits input batch into several sub-batches and then
-// run those sub-batches using pipeline parallel. This function
+// This function splits input batch into several micro-batches and then
+// run those micro-batches using pipeline parallel. This function
 // is responsible for adding pipeline-related feeds such as event IDs before
 // calling the graph.
 common::Status TrainingSession::RunWithPipeline(const RunOptions& run_options, IOBinding& io_binding) {
-  const size_t num_steps = pipeline_context_.num_pipeline_steps;
+  const size_t num_steps = pipeline_context_.num_pipeline_micro_batches;
   const size_t stage_id = pipeline_context_.pipeline_stage_id;
   const bool training_mode = true;
 
@@ -1187,7 +1178,7 @@ common::Status TrainingSession::RunWithPipeline(const RunOptions& run_options, I
     ORT_RETURN_IF_ERROR(status);
 
     // Add inputs and outputs to the binding.
-    CreateBatchVariables(io_binding, *sub_io_binding.get(), i, num_steps);
+    CreateMicroBatchVariables(io_binding, *sub_io_binding.get(), i, num_steps);
 
     // Add proper events to the binding.
     CreatePipelineEvents(training_mode, i, stage_id, *sub_io_binding.get());
