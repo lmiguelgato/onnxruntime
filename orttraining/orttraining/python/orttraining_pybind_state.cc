@@ -55,7 +55,6 @@ struct TrainingParameters {
   bool transformer_layer_recompute = false;
   int number_recompute_layers = 0;
   bool use_adasum = false;
-  bool perform_fp16_allreduce = true;
 };
 
 struct TrainingConfigurationResult {
@@ -126,7 +125,7 @@ TrainingConfigurationResult ConfigureSessionForTraining(
       return it->second;
     };
     opt.use_mixed_precision_moments = parameters.use_fp16_moments;
-    opt.do_all_reduce_in_mixed_precision_type = parameters.perform_fp16_allreduce;
+    opt.do_all_reduce_in_mixed_precision_type = true;
     // TODO: this mapping is temporary.
     // For now, nccl allreduce kernel only implements for allreduce_post_accumulation
     // hovorod allreduce kernel only implements for not allreduce_post_accumulation.
@@ -222,8 +221,7 @@ void addObjectMethodsForTraining(py::module& m) {
       .def_readwrite("data_parallel_size", &TrainingParameters::data_parallel_size)
       .def_readwrite("horizontal_parallel_size", &TrainingParameters::horizontal_parallel_size)
       .def_readwrite("pipeline_parallel_size", &TrainingParameters::pipeline_parallel_size)
-      .def_readwrite("use_adasum", &TrainingParameters::use_adasum)
-      .def_readwrite("perform_fp16_allreduce", &TrainingParameters::perform_fp16_allreduce);
+      .def_readwrite("use_adasum", &TrainingParameters::use_adasum);
 
 #if defined(USE_MPI)
   m.def("get_mpi_context_local_rank", []() -> int { return MPIContext::GetInstance().GetLocalRank(); });
